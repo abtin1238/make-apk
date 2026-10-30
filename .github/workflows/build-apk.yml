@@ -1,0 +1,156 @@
+name: Build APK from zip
+
+# Put the project zip (e.g. AbtinBrowserFlutter_v16_smart_dark.zip) in the ROOT of the repo and push.
+# The workflow unzips it, finds pubspec.yaml, and builds a release APK (arm64-v8a).
+# Also works if the project is already unzipped in the repo (no zip = it builds the repo itself).
+on:
+  push:
+    paths:
+      - '*.zip'
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: 'Zip to build (path in repo). Empty = newest *.zip in the repo root'
+        required: false
+        default: ''
+      flutter_version:
+        description: 'Flutter version, e.g. 3.47.0 (empty = latest stable; project needs >= 3.47.0)'
+        required: false
+        default: ''
+      publish_release:
+        description: 'Also attach the APK to a GitHub Release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # only used by the optional release step
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find and unzip the project
+        id: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP="${{ github.event.inputs.zip_path }}"
+          if [ -z "$ZIP" ]; then
+            # prefer the zip changed by this push, else the highest version-sorted zip in the root
+            ZIP="$(git diff --name-only HEAD~1 HEAD -- '*.zip' 2>/dev/null | head -1 || true)"
+            [ -n "$ZIP" ] || ZIP="$(ls -1 *.zip 2>/dev/null | sort -V | tail -1 || true)"
+          fi
+          rm -rf "$RUNNER_TEMP/src" && mkdir -p "$RUNNER_TEMP/src"
+          if [ -n "$ZIP" ] && [ -f "$ZIP" ]; then
+            echo "Building from zip: $ZIP"
+            unzip -q -o "$ZIP" -d "$RUNNER_TEMP/src"
+            ROOT="$RUNNER_TEMP/src"
+          else
+            echo "No zip found - building the repository itself"
+            ROOT="$GITHUB_WORKSPACE"
+          fi
+          # project root = shallowest pubspec.yaml that is not inside packages/
+          PUB="$(find "$ROOT" -maxdepth 4 -name pubspec.yaml -not -path '*/packages/*' -not -path '*/.dart_tool/*' | awk '{print length, $0}' | sort -n | head -1 | cut -d' ' -f2-)"
+          [ -n "$PUB" ] || { echo "::error::pubspec.yaml not found"; exit 1; }
+          echo "dir=$(dirname "$PUB")" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "${ZIP:-repo}" .zip)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ github.event.inputs.flutter_version }}
+          cache: true
+
+      - name: Android SDK licenses and platform
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-37" "platform-tools" >/dev/null || true
+
+      - name: Prepare Android project (local.properties, signing)
+        working-directory: ${{ steps.src.outputs.dir }}
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # the zip carries the author's local paths: rewrite them for this runner
+          FLUTTER_ROOT_DIR="$(dirname "$(dirname "$(which flutter)")")"
+          {
+            echo "sdk.dir=${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+            echo "flutter.sdk=$FLUTTER_ROOT_DIR"
+          } > android/local.properties
+          chmod +x android/gradlew || true
+          mkdir -p android/keystore
+          if [ -n "${KEYSTORE_BASE64:-}" ]; then
+            echo "Signing with the keystore from repository secrets"
+            echo "$KEYSTORE_BASE64" | base64 -d > android/keystore/ci-release.jks
+            cat > android/key.properties <<PROPS
+          storeFile=keystore/ci-release.jks
+          storePassword=${KEYSTORE_PASSWORD}
+          keyAlias=${KEY_ALIAS}
+          keyPassword=${KEY_PASSWORD:-$KEYSTORE_PASSWORD}
+          PROPS
+          elif [ -f android/key.properties ] && grep -q '^storeFile=' android/key.properties \
+               && [ -f "android/$(grep '^storeFile=' android/key.properties | cut -d= -f2)" ]; then
+            echo "Signing with the key.properties + keystore that are inside the zip"
+          else
+            echo "::warning::No keystore found - using a throw-away key. The APK installs, but cannot update an app signed with another key."
+            keytool -genkeypair -v -keystore android/keystore/ci-release.jks -storepass android -keypass android \
+              -alias ci -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Abtin CI" >/dev/null 2>&1
+            printf 'storeFile=keystore/ci-release.jks\nstorePassword=android\nkeyAlias=ci\nkeyPassword=android\n' > android/key.properties
+          fi
+
+      - name: Dependencies
+        working-directory: ${{ steps.src.outputs.dir }}
+        run: flutter pub get
+
+      - name: Analyze (does not block the build)
+        working-directory: ${{ steps.src.outputs.dir }}
+        continue-on-error: true
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Build release APK
+        working-directory: ${{ steps.src.outputs.dir }}
+        run: flutter build apk --release --target-platform android-arm64
+
+      - name: Collect APK
+        id: apk
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="${{ steps.src.outputs.dir }}/build/app/outputs/flutter-apk/app-release.apk"
+          NAME="${{ steps.src.outputs.name }}.apk"
+          mkdir -p dist && cp "$OUT" "dist/$NAME"
+          ls -lh dist
+          echo "file=dist/$NAME" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.src.outputs.name }}-apk
+          path: ${{ steps.apk.outputs.file }}
+          retention-days: 30
+
+      - name: Attach to a GitHub Release
+        if: ${{ github.event.inputs.publish_release == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: ${{ steps.src.outputs.name }}
+          files: ${{ steps.apk.outputs.file }}
