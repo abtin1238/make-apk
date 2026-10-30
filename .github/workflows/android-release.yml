@@ -1,0 +1,198 @@
+name: Android Release APKs
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ARMv7 32-bit
+            abi: armeabi-v7a
+            platform: android-arm
+          - name: ARM64
+            abi: arm64-v8a
+            platform: android-arm64
+          - name: x86 32-bit
+            abi: x86
+            platform: android-x86
+          - name: x86_64
+            abi: x86_64
+            platform: android-x64
+
+    env:
+      ORG_GRADLE_PROJECT_targetAbi: ${{ matrix.abi }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      # Do not use android-actions/setup-android here. Its default package
+      # list includes the obsolete SDK package "tools", which caused all
+      # four jobs to fail with: Failed to find package 'tools'.
+      - name: Install required Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [[ -z "$SDK_ROOT" || ! -d "$SDK_ROOT" ]]; then
+            echo "Android SDK was not found on the GitHub runner." >&2
+            exit 1
+          fi
+
+          export ANDROID_HOME="$SDK_ROOT"
+          export ANDROID_SDK_ROOT="$SDK_ROOT"
+
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager 2>/dev/null | sort -V | tail -n 1)"
+          if [[ -z "$SDKMANAGER" ]]; then
+            echo "sdkmanager was not found under $SDK_ROOT/cmdline-tools." >&2
+            exit 1
+          fi
+
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" --install \
+            "platform-tools" \
+            "platforms;android-37"
+
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Resolve Flutter packages
+        run: flutter pub get
+
+      - name: Configure release signing
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD ANDROID_STORE_PASSWORD; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Missing required GitHub Actions secret: $name" >&2
+              exit 1
+            fi
+          done
+
+          mkdir -p android/keystore
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/keystore/abtin-release.jks
+          test -s android/keystore/abtin-release.jks
+
+          cat > android/key.properties <<EOF
+          storePassword=$ANDROID_STORE_PASSWORD
+          keyPassword=$ANDROID_KEY_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
+          storeFile=keystore/abtin-release.jks
+          EOF
+
+      - name: Build signed release APK
+        run: |
+          flutter build apk \
+            --release \
+            --target-platform "${{ matrix.platform }}" \
+            --no-pub
+
+      - name: Verify APK and native architecture
+        shell: bash
+        env:
+          EXPECTED_ABI: ${{ matrix.abi }}
+        run: |
+          set -euo pipefail
+          APK="build/app/outputs/flutter-apk/app-release.apk"
+          test -s "$APK"
+
+          mapfile -t APIS < <(
+            unzip -Z1 "$APK" |
+            awk -F/ '$1 == "lib" && $3 ~ /\.so$/ {print $2}' |
+            sort -u
+          )
+
+          if [[ "${#APIS[@]}" -ne 1 || "${APIS[0]}" != "$EXPECTED_ABI" ]]; then
+            printf 'Expected only %s, found: %s\n' "$EXPECTED_ABI" "${APIS[*]:-none}" >&2
+            exit 1
+          fi
+
+          unzip -Z1 "$APK" | grep -q "^lib/$EXPECTED_ABI/.*\.so$"
+          echo "Verified native ABI: $EXPECTED_ABI"
+
+      - name: Package architecture ZIP
+        shell: bash
+        env:
+          ABI: ${{ matrix.abi }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/package
+          cp build/app/outputs/flutter-apk/app-release.apk \
+            "dist/package/AbtinBrowser-${ABI}.apk"
+
+          cat > dist/package/README.txt <<EOF
+          Abtin Browser - Android release
+          Architecture: ${ABI}
+          Install this APK only on a device compatible with ${ABI}.
+          Signed release APK.
+          EOF
+
+          (cd dist/package && sha256sum "AbtinBrowser-${ABI}.apk" > SHA256SUMS)
+          (cd dist/package && zip -9 "../AbtinBrowser-${ABI}.zip" \
+            "AbtinBrowser-${ABI}.apk" README.txt SHA256SUMS)
+
+      - name: Upload architecture ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: abtin-browser-${{ matrix.abi }}-zip
+          path: dist/AbtinBrowser-${{ matrix.abi }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-release:
+    name: Attach architecture ZIPs to GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all architecture ZIPs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: abtin-browser-*-zip
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ls -lh dist/*.zip
+          gh release create "$GITHUB_REF_NAME" dist/*.zip \
+            --generate-notes \
+            --title "Abtin Browser $GITHUB_REF_NAME"
