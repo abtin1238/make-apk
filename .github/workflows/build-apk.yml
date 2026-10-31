@@ -4,7 +4,7 @@ name: Build APK from zip
 # The workflow unzips it, finds pubspec.yaml, and builds a release APK (arm64-v8a).
 # Also works if the project is already unzipped in the repo (no zip = it builds the repo itself).
 on:
-  push:
+  
     paths:
       - '*.zip'
   workflow_dispatch:
