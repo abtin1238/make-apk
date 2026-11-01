@@ -1,0 +1,85 @@
+name: Release previous build
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Run ID of the build to release (empty = latest successful build)'
+        required: false
+        default: ''
+      build_workflow:
+        description: 'Build workflow name or file'
+        required: false
+        default: 'Apk to release (arm64 / armv7 / x86_64)'
+      release_name:
+        description: 'Release title (empty = automatic)'
+        required: false
+        default: ''
+      prerelease:
+        description: 'Mark as pre-release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find the build run
+        id: run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+          WF: ${{ inputs.build_workflow }}
+        run: |
+          set -euo pipefail
+          if [ -z "$RUN_ID" ]; then
+            RUN_ID="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow "$WF" --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
+          fi
+          [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ] || { echo "::error::No successful build run found"; exit 1; }
+          NUM="$(gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json number --jq '.number')"
+          echo "Using run $RUN_ID (build #$NUM)"
+          echo "id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "num=$NUM" >> "$GITHUB_OUTPUT"
+
+      - name: Download the build artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ steps.run.outputs.id }}
+        run: |
+          set -euo pipefail
+          mkdir -p dl
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern '*-build-*' --dir dl \
+            || { echo "::error::Artifact not found (expired after 30 days, or the run has none)"; exit 1; }
+          find dl -type f | sort
+          [ -n "$(find dl -type f -name '*.zip' | head -1)" ] || { echo "::error::No ZIP in the artifact"; exit 1; }
+
+      - name: Create or update the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NUM: ${{ steps.run.outputs.num }}
+          TITLE: ${{ inputs.release_name }}
+          PRE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          TAG="build-$NUM"
+          [ -n "$TITLE" ] || TITLE="Abtin build $NUM"
+          mapfile -t FILES < <(find dl -type f -name '*.zip')
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG exists: replacing its files"
+            gh release upload "$TAG" "${FILES[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            ARGS=()
+            [ "$PRE" = "true" ] && ARGS+=(--prerelease)
+            gh release create "$TAG" "${FILES[@]}" --repo "$GITHUB_REPOSITORY" \
+              --title "$TITLE" --notes "Build #$NUM" --target "$GITHUB_SHA" "${ARGS[@]}"
+          fi
+          echo "Released: $TAG"
