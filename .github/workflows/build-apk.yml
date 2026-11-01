@@ -173,7 +173,11 @@ jobs:
           abis=$(unzip -Z1 "$apk" | grep -oE '^lib/[^/]+/' | sort -u | tr -d '\n')
           echo "native ABIs in APK: $abis"
           [ "$abis" = "lib/${{ matrix.abi }}/" ] || { echo "::error::wrong ABI set"; exit 1; }
-          unzip -Z1 "$apk" | grep -q "lib/${{ matrix.abi }}/libxul.so" || { echo "::error::GeckoView libxul.so missing"; exit 1; }
+          if grep -rqi "geckoview" android --include=*.gradle --include=*.kts --include=*.properties 2>/dev/null; then
+            unzip -Z1 "$apk" | grep -q "lib/${{ matrix.abi }}/libxul.so" || { echo "::error::GeckoView libxul.so missing"; exit 1; }
+          else
+            echo "GeckoView not used by this project: libxul check skipped"
+          fi
           if unzip -Z1 "$apk" | grep -q "lib/${{ matrix.abi }}/libgojni.so"; then echo "v2ray core: included"; else echo "v2ray core: NOT included for this ABI"; fi
 
       - name: Collect APK
