@@ -72,7 +72,16 @@ jobs:
           set -euo pipefail
           TAG="build-$NUM"
           [ -n "$TITLE" ] || TITLE="Abtin build $NUM"
-          mapfile -t FILES < <(find dl -type f -name '*.zip')
+          # unpack whatever was downloaded (old combined ZIP or separate ZIPs), then one ZIP per APK
+          mkdir -p apks out
+          while IFS= read -r z; do unzip -q -o -j "$z" '*.apk' -d apks || true; done < <(find dl -type f -name '*.zip')
+          [ -n "$(ls apks/*.apk 2>/dev/null)" ] || { echo "::error::No APK found in the artifact"; exit 1; }
+          for apk in apks/*.apk; do
+            b="$(basename "$apk" .apk)"
+            zip -9 -X -j "out/${b}.zip" "$apk"
+          done
+          ls -lh out
+          mapfile -t FILES < <(find out -type f -name '*.zip' | sort)
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Release $TAG exists: replacing its files"
             gh release upload "$TAG" "${FILES[@]}" --repo "$GITHUB_REPOSITORY" --clobber
