@@ -41,6 +41,21 @@ jobs:
           - { abi: x86_64,      platform: android-x64 }
 
     steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: false          # keep Android SDK: sdkmanager and flutter build need it
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: true
+
+      - name: Show free disk space
+        shell: bash
+        run: df -h /
+
       - uses: actions/checkout@v4
 
       - name: Find and unzip project
