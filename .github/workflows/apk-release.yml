@@ -225,6 +225,12 @@ jobs:
     if: ${{ !cancelled() && needs.apk.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
+      # the repository goes into its own folder (src/), so checkout can never delete apks/ or dist/
+      - uses: actions/checkout@v4
+        if: ${{ inputs.publish_release }}
+        with:
+          path: src
+
       - uses: actions/download-artifact@v4
         with:
           pattern: tmp-apk-*
@@ -265,11 +271,9 @@ jobs:
       #   - key files committed directly (android/keystore/, key.properties, *.jks, *.keystore)
       #   - the same files inside any project ZIP committed in the repository
       # The branch and the original ZIPs stay untouched; the APKs above were already built with the key.
-      - uses: actions/checkout@v4
-        if: ${{ inputs.publish_release }}
-
       - name: Tag a keystore-free copy of the source
         if: ${{ inputs.publish_release }}
+        working-directory: src
         shell: bash
         run: |
           set -euo pipefail
@@ -318,3 +322,4 @@ jobs:
           tag_name: build-${{ github.run_number }}
           name: Abtin build ${{ github.run_number }}
           files: dist/*.zip
+          fail_on_unmatched_files: true
