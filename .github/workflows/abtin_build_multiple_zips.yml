@@ -1,0 +1,229 @@
+name: Build APKs from project ZIPs
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_paths:
+        description: "Project ZIP paths in this repository; separate multiple paths with commas or new lines"
+        required: true
+        type: string
+      tag:
+        description: "Release tag, e.g. v0.0.24"
+        required: true
+        default: "v0.0.24"
+        type: string
+      release_name:
+        description: "Release display name"
+        required: true
+        default: "Abtin Maps v0.0.24"
+        type: string
+      flutter_version:
+        description: "Flutter version (empty = latest stable)"
+        required: false
+        default: ""
+        type: string
+      max_parallel:
+        description: "Maximum parallel build jobs"
+        required: false
+        default: "20"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: Prepare release and build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      tag: ${{ steps.matrix.outputs.tag }}
+      release_name: ${{ steps.matrix.outputs.release_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate inputs and create matrix
+        id: matrix
+        shell: bash
+        env:
+          ZIP_INPUT: ${{ inputs.zip_paths }}
+          TAG_INPUT: ${{ inputs.tag }}
+          RELEASE_NAME_INPUT: ${{ inputs.release_name }}
+        run: |
+          set -euo pipefail
+          [ -n "$TAG_INPUT" ] || { echo "::error::Release tag is required"; exit 1; }
+          [ -n "$RELEASE_NAME_INPUT" ] || { echo "::error::Release display name is required"; exit 1; }
+
+          mapfile -t requested < <(printf '%s\n' "$ZIP_INPUT" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed '/^$/d')
+          [ "${#requested[@]}" -gt 0 ] || { echo "::error::At least one project ZIP is required"; exit 1; }
+
+          zips=()
+          declare -A seen=()
+          for path in "${requested[@]}"; do
+            if [[ "$path" == *[\\*\\?\\[]* ]]; then
+              mapfile -t matches < <(compgen -G "$path" | sort || true)
+              [ "${#matches[@]}" -gt 0 ] || { echo "::error::No ZIP matches: $path"; exit 1; }
+              for file in "${matches[@]}"; do
+                [ -f "$file" ] && [[ "$file" == *.zip ]] || continue
+                if [ -z "${seen[$file]:-}" ]; then seen[$file]=1; zips+=("$file"); fi
+              done
+            else
+              [ -f "$path" ] || { echo "::error::ZIP not found: $path"; exit 1; }
+              [[ "$path" == *.zip ]] || { echo "::error::Not a ZIP file: $path"; exit 1; }
+              if [ -z "${seen[$path]:-}" ]; then seen[$path]=1; zips+=("$path"); fi
+            fi
+          done
+
+          [ "${#zips[@]}" -gt 0 ] || { echo "::error::No project ZIPs selected"; exit 1; }
+          [ "${#zips[@]}" -le 85 ] || { echo "::error::Maximum 85 ZIPs per run (85 x 3 = 255 jobs)"; exit 1; }
+
+          matrix_file="$RUNNER_TEMP/matrix.jsonl"
+          : > "$matrix_file"
+          index=0
+          for zip_path in "${zips[@]}"; do
+            index=$((index + 1))
+            base="$(basename "$zip_path" .zip)"
+            safe="$(printf '%s' "$base" | tr -c 'A-Za-z0-9._-' '_')"
+            for abi in arm64-v8a armeabi-v7a x86_64; do
+              jq -cn --arg id "${index}-${abi}" --arg zip "$zip_path" --arg name "$safe" --arg abi "$abi" '{id:$id, zip:$zip, name:$name, abi:$abi}' >> "$matrix_file"
+            done
+          done
+
+          echo "matrix=$(jq -cs '{include: .}' "$matrix_file")" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG_INPUT" >> "$GITHUB_OUTPUT"
+          echo "release_name=$RELEASE_NAME_INPUT" >> "$GITHUB_OUTPUT"
+          echo "Selected ZIPs: ${#zips[@]}"
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.matrix.outputs.tag }}
+          RELEASE_NAME: ${{ steps.matrix.outputs.release_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --title "$RELEASE_NAME"
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$RELEASE_NAME" --notes "$RELEASE_NAME" --target "$GITHUB_SHA"
+          fi
+
+  build:
+    name: ${{ matrix.name }} / ${{ matrix.abi }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(inputs.max_parallel || '20') }}
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: ${{ matrix.zip }}
+          sparse-checkout-cone-mode: false
+
+      - name: Extract project ZIP
+        id: project
+        env:
+          ZIP_PATH: ${{ matrix.zip }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -f "$ZIP_PATH" ] || { echo "::error::Project ZIP not found: $ZIP_PATH"; exit 1; }
+          ROOT="$RUNNER_TEMP/project"
+          mkdir -p "$ROOT"
+          unzip -q "$ZIP_PATH" -d "$ROOT"
+          PUBSPEC="$(find "$ROOT" -maxdepth 6 -name pubspec.yaml -not -path '*/.dart_tool/*' | head -n 1)"
+          [ -n "$PUBSPEC" ] || { echo "::error::pubspec.yaml not found inside ZIP"; exit 1; }
+          echo "dir=$(dirname "$PUBSPEC")" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ inputs.flutter_version }}
+          cache: true
+
+      - name: Configure Android signing from GitHub Secrets
+        working-directory: ${{ steps.project.outputs.dir }}
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for secret_name in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS; do
+            [ -n "${!secret_name:-}" ] || { echo "::error::Missing GitHub Actions secret: $secret_name"; exit 1; }
+          done
+          mkdir -p android/keystore
+          KEYSTORE_FILE="android/keystore/github-release.jks"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_FILE"
+          [ -s "$KEYSTORE_FILE" ] || { echo "::error::Decoded keystore is empty"; exit 1; }
+          chmod 600 "$KEYSTORE_FILE"
+          EFFECTIVE_KEY_PASSWORD="${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+          keytool -list -keystore "$KEYSTORE_FILE" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null
+          printf 'storeFile=keystore/github-release.jks\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' "$KEYSTORE_PASSWORD" "$KEY_ALIAS" "$EFFECTIVE_KEY_PASSWORD" > android/key.properties
+          chmod 600 android/key.properties
+          chmod +x android/gradlew 2>/dev/null || true
+
+      - name: Install dependencies
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: flutter pub get
+
+      - name: Build separate APK for ${{ matrix.abi }}
+        working-directory: ${{ steps.project.outputs.dir }}
+        env:
+          ABI: ${{ matrix.abi }}
+          APP_NAME: ${{ matrix.name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$ABI" in
+            arm64-v8a) PLATFORM="android-arm64" ;;
+            armeabi-v7a) PLATFORM="android-arm" ;;
+            x86_64) PLATFORM="android-x64" ;;
+            *) echo "::error::Unsupported ABI: $ABI"; exit 1 ;;
+          esac
+          flutter build apk --release --split-per-abi --target-platform "$PLATFORM" --split-debug-info=build/symbols
+          APK="build/app/outputs/flutter-apk/app-${ABI}-release.apk"
+          [ -f "$APK" ] || { echo "::error::APK for $ABI was not generated"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/output"
+          cp "$APK" "$RUNNER_TEMP/output/${APP_NAME}-${ABI}.apk"
+          (cd "$RUNNER_TEMP/output" && zip -9 -X "${APP_NAME}-${ABI}.zip" "${APP_NAME}-${ABI}.apk" && rm "${APP_NAME}-${ABI}.apk")
+
+      - name: Upload ZIP as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}-${{ matrix.abi }}
+          path: ${{ runner.temp }}/output/*.zip
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Attach ABI ZIP to Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE="$(find "$RUNNER_TEMP/output" -maxdepth 1 -name '*.zip' -print -quit)"
+          [ -n "$FILE" ] || { echo "::error::Release ZIP not found"; exit 1; }
+          for attempt in 1 2 3 4 5; do
+            if gh release upload "$TAG" "$FILE" --repo "$GITHUB_REPOSITORY" --clobber; then
+              echo "Uploaded $(basename "$FILE") to $TAG"
+              exit 0
+            fi
+            echo "Upload attempt $attempt failed; retrying in 15 seconds"
+            sleep 15
+          done
+          echo "::error::Could not upload $(basename "$FILE")"
+          exit 1
