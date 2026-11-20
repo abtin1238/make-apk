@@ -7,6 +7,10 @@ on:
         description: Git tag for this release, for example v1.0.0
         required: true
         type: string
+       release_name:
+        description: Visible GitHub Release title
+        required: false
+        type: string
       zip_paths:
         description: 'ZIP paths in repository: separate with comma or new line, globs allowed (e.g. zips/*.zip). Empty = build repository directly'
         required: false
