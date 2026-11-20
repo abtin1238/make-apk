@@ -3,6 +3,10 @@ name: Apk to release from secret key
 on:
   workflow_dispatch:
     inputs:
+      tag:
+        description: Git tag for this release, for example v1.0.0
+        required: true
+        type: string
       zip_paths:
         description: 'ZIP paths in repository: separate with comma or new line, globs allowed (e.g. zips/*.zip). Empty = build repository directly'
         required: false
