@@ -1,175 +1,175 @@
-name: Release previous build
+name: Build APKs
 
 on:
   workflow_dispatch:
     inputs:
-      run_id:
-        description: 'Run ID of the build to release (empty = latest successful build)'
-        required: false
-        default: ''
-
-      build_workflow:
-        description: 'Build workflow name or file'
-        required: false
-        default: 'Apk to release (arm64 / armv7 / x86_64)'
-
       tag:
-        description: 'Release tag (example: v0.0.24)'
+        description: "تگ ریلیز (مثلاً v1.0.0)"
         required: true
-        default: 'v0.0.24'
-
-      release_name:
-        description: 'Release title'
+      display_names:
+        description: "نام نمایشی، جداشده با کاما و هم‌ترتیب با زیپ‌ها (خالی = اسم زیپ)"
+        required: false
+      zips:
+        description: "مسیر زیپ‌ها در ریپو یا لینک http؛ با کاما یا خط جدید جدا کن"
         required: true
-        default: 'Abtin Maps v0.0.24'
-
-      prerelease:
-        description: 'Mark as pre-release'
-        type: boolean
-        default: false
 
 permissions:
   contents: write
-  actions: read
 
 jobs:
-  release:
+  prepare:
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        env:
+          ZIPS: ${{ inputs.zips }}
+          NAMES: ${{ inputs.display_names }}
+        run: |
+          python3 - <<'EOF'
+          import json, os
+          zips  = [z.strip() for z in os.environ['ZIPS'].replace('\n', ',').split(',') if z.strip()]
+          names = [n.strip() for n in os.environ['NAMES'].split(',') if n.strip()]
+          inc = []
+          for i, z in enumerate(zips):
+              base = os.path.splitext(os.path.basename(z))[0]
+              inc.append({"zip": z, "name": names[i] if i < len(names) else base, "id": base})
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write("matrix=" + json.dumps({"include": inc}) + "\n")
+          EOF
 
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    env:
+      APP_NAME: ${{ matrix.name }}
+      TAG: ${{ inputs.tag }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Find the build run
-        id: run
-        shell: bash
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Fetch and unzip project
         env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ inputs.run_id }}
-          WF: ${{ inputs.build_workflow }}
+          ZIP: ${{ matrix.zip }}
         run: |
-          set -euo pipefail
+          mkdir -p work
+          if [[ "$ZIP" == http* ]]; then curl -fL "$ZIP" -o project.zip; else cp "$ZIP" project.zip; fi
+          unzip -q project.zip -d work
+          ROOT=$(find work -maxdepth 4 \( -name pubspec.yaml -o -name settings.gradle -o -name settings.gradle.kts \) -printf '%h\n' \
+                 | awk '{print length, $0}' | sort -n | head -1 | cut -d' ' -f2-)
+          [ -n "$ROOT" ] || { echo "پروژه پیدا نشد"; exit 1; }
+          echo "ROOT=$ROOT" >> $GITHUB_ENV
+          if [ -f "$ROOT/pubspec.yaml" ]; then echo "KIND=flutter" >> $GITHUB_ENV; else echo "KIND=native" >> $GITHUB_ENV; fi
 
-          if [ -z "$RUN_ID" ]; then
-            RUN_ID="$(gh run list \
-              --repo "$GITHUB_REPOSITORY" \
-              --workflow "$WF" \
-              --status success \
-              --limit 1 \
-              --json databaseId \
-              --jq '.[0].databaseId')"
-          fi
-
-          [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ] || {
-            echo "::error::No successful build run found"
-            exit 1
-          }
-
-          NUM="$(gh run view "$RUN_ID" \
-            --repo "$GITHUB_REPOSITORY" \
-            --json number \
-            --jq '.number')"
-
-          echo "Using run $RUN_ID (build #$NUM)"
-          echo "id=$RUN_ID" >> "$GITHUB_OUTPUT"
-          echo "num=$NUM" >> "$GITHUB_OUTPUT"
-
-      - name: Download the build artifact
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ steps.run.outputs.id }}
+      - name: Set display name (android:label)
         run: |
-          set -euo pipefail
-
-          mkdir -p dl
-
-          gh run download "$RUN_ID" \
-            --repo "$GITHUB_REPOSITORY" \
-            --pattern '*-build-*' \
-            --dir dl \
-            || {
-              echo "::error::Artifact not found"
-              exit 1
-            }
-
-          find dl -type f | sort
-
-          [ -n "$(find dl -type f -name '*.zip' | head -1)" ] || {
-            echo "::error::No ZIP in the artifact"
-            exit 1
-          }
-
-      - name: Create or update the release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          NUM: ${{ steps.run.outputs.num }}
-          TAG: ${{ inputs.tag }}
-          TITLE: ${{ inputs.release_name }}
-          PRE: ${{ inputs.prerelease }}
-        run: |
-          set -euo pipefail
-
-          [ -n "$TAG" ] || {
-            echo "::error::Release tag cannot be empty"
-            exit 1
-          }
-
-          [ -n "$TITLE" ] || {
-            echo "::error::Release title cannot be empty"
-            exit 1
-          }
-
-          mkdir -p apks out
-
-          # Extract APK files from downloaded ZIPs
-          while IFS= read -r z; do
-            unzip -q -o -j "$z" '*.apk' -d apks || true
-          done < <(find dl -type f -name '*.zip')
-
-          [ -n "$(find apks -maxdepth 1 -type f -name '*.apk' -print -quit)" ] || {
-            echo "::error::No APK found in the artifact"
-            exit 1
-          }
-
-          # Create one ZIP for each APK
-          for apk in apks/*.apk; do
-            [ -f "$apk" ] || continue
-            b="$(basename "$apk" .apk)"
-            zip -9 -X -j "out/${b}.zip" "$apk"
+          SAFE=$(printf '%s' "$APP_NAME" | sed -e 's/[&/\]/\\&/g')
+          for M in "$ROOT/android/app/src/main/AndroidManifest.xml" "$ROOT/app/src/main/AndroidManifest.xml"; do
+            [ -f "$M" ] && sed -i -E "0,/android:label=\"[^\"]*\"/s//android:label=\"$SAFE\"/" "$M"
           done
+          true
 
-          ls -lh out
-
-          mapfile -t FILES < <(find out -type f -name '*.zip' | sort)
-
-          [ "${#FILES[@]}" -gt 0 ] || {
-            echo "::error::No release files created"
-            exit 1
+      - name: Prepare keystore + signing init script
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          {
+            echo "KS_PATH=$RUNNER_TEMP/release.jks"
+            echo "KS_PASS=$KEYSTORE_PASSWORD"
+            echo "KEY_ALIAS=$KEY_ALIAS"
+            echo "KEY_PASS=$KEY_PASSWORD"
+          } >> $GITHUB_ENV
+          [ "$KIND" = "native" ] && echo "ABI_SPLIT=1" >> $GITHUB_ENV
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/ci-sign.gradle <<'EOF'
+          allprojects { p ->
+            p.afterEvaluate {
+              def a = p.extensions.findByName('android')
+              if (a != null && p.plugins.hasPlugin('com.android.application')) {
+                a.signingConfigs.create('ci') { c ->
+                  c.storeFile = new File(System.getenv('KS_PATH'))
+                  c.storePassword = System.getenv('KS_PASS')
+                  c.keyAlias = System.getenv('KEY_ALIAS')
+                  c.keyPassword = System.getenv('KEY_PASS')
+                }
+                a.buildTypes.release.signingConfig = a.signingConfigs.ci
+                if (System.getenv('ABI_SPLIT') == '1') {
+                  a.splits.abi {
+                    enable = true
+                    reset()
+                    include 'arm64-v8a', 'armeabi-v7a', 'x86_64'
+                    universalApk = false
+                  }
+                }
+              }
+            }
           }
+          EOF
 
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $TAG exists: replacing its files"
+      - uses: subosito/flutter-action@v2
+        if: env.KIND == 'flutter'
+        with:
+          channel: stable
+          cache: true
 
-            gh release upload "$TAG" "${FILES[@]}" \
-              --repo "$GITHUB_REPOSITORY" \
-              --clobber
+      - name: Build (Flutter, split per ABI)
+        if: env.KIND == 'flutter'
+        working-directory: ${{ env.ROOT }}
+        run: |
+          flutter pub get
+          flutter build apk --release --split-per-abi
 
-            gh release edit "$TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "$TITLE" \
-              --notes "Build #$NUM"
-          else
-            ARGS=()
-            [ "$PRE" = "true" ] && ARGS+=(--prerelease)
+      - name: Build (native Gradle)
+        if: env.KIND == 'native'
+        working-directory: ${{ env.ROOT }}
+        run: |
+          if [ -f gradlew ]; then chmod +x gradlew; ./gradlew assembleRelease --no-daemon; else gradle assembleRelease --no-daemon; fi
 
-            gh release create "$TAG" "${FILES[@]}" \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "$TITLE" \
-              --notes "Build #$NUM" \
-              --target "$GITHUB_SHA" \
-              "${ARGS[@]}"
-          fi
+      - name: Collect APKs
+        run: |
+          mkdir -p out
+          SAFE=$(echo "$APP_NAME" | tr ' /' '__')
+          find "$ROOT" -name '*.apk' -path '*release*' ! -name '*unsigned*' | while read f; do
+            b=$(basename "$f")
+            case "$b" in
+              *arm64-v8a*)   abi=arm64-v8a ;;
+              *armeabi-v7a*) abi=armeabi-v7a ;;
+              *x86_64*)      abi=x86_64 ;;
+              *)             abi=universal ;;
+            esac
+            cp "$f" "out/${SAFE}-${TAG}-${abi}.apk"
+          done
+          ls -la out
+          [ "$(ls out | wc -l)" -gt 0 ] || { echo "APK پیدا نشد"; exit 1; }
 
-          echo "Released: $TAG"
-          echo "Release title: $TITLE"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apks-${{ matrix.id }}
+          path: out/*.apk
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: apks-*
+          merge-multiple: true
+          path: out
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.tag }}
+          files: out/*.apk
