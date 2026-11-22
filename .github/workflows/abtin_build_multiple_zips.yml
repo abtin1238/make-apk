@@ -135,8 +135,22 @@ jobs:
           ROOT="$RUNNER_TEMP/project"
           mkdir -p "$ROOT"
           unzip -q "$ZIP_PATH" -d "$ROOT"
-          PUBSPEC="$(find "$ROOT" -maxdepth 6 -name pubspec.yaml -not -path '*/.dart_tool/*' | head -n 1)"
-          [ -n "$PUBSPEC" ] || { echo "::error::pubspec.yaml not found inside ZIP"; exit 1; }
+
+          # Pick the app's own pubspec.yaml, not one from vendor/ or other nested packages:
+          # must be a Flutter app (has lib/main.dart), outside vendor/.dart_tool/.symlinks/example,
+          # and the shallowest one wins.
+          PUBSPEC=""
+          while IFS= read -r candidate; do
+            dir="$(dirname "$candidate")"
+            if [ -f "$dir/lib/main.dart" ]; then PUBSPEC="$candidate"; break; fi
+          done < <(find "$ROOT" -maxdepth 6 -name pubspec.yaml \
+                     -not -path '*/.dart_tool/*' \
+                     -not -path '*/vendor/*' \
+                     -not -path '*/.symlinks/*' \
+                     -not -path '*/example/*' \
+                     -printf '%d %p\n' | sort -n | cut -d' ' -f2-)
+          [ -n "$PUBSPEC" ] || { echo "::error::No Flutter app (pubspec.yaml + lib/main.dart) found inside ZIP"; exit 1; }
+          echo "Using project: $(dirname "$PUBSPEC")"
           echo "dir=$(dirname "$PUBSPEC")" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-java@v4
