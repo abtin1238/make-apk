@@ -1,4 +1,4 @@
-name: Build APKs from project ZIPs
+name: Build APKs from project 2ZIPs
 
 on:
   workflow_dispatch:
