@@ -36,8 +36,8 @@ jobs:
           cd "$(dirname "$(dirname "$MK")")"
           pwd
           export WITHOUT_PYTHON=1
-          make -C src clean loader.elf build.h WITHOUT_PYTHON=1 CPPFLAGS="-I/usr/include"
-          LDFLAGS="-static" make -C src proot WITHOUT_PYTHON=1 CPPFLAGS="-I/usr/include"
+          make -C src clean loader.elf build.h WITHOUT_PYTHON=1
+          LDFLAGS="-static" make -C src proot WITHOUT_PYTHON=1
           mkdir -p /w/out
           strip src/proot
           cp src/proot /w/out/libproot.so
