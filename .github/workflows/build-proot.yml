@@ -1,0 +1,33 @@
+name: Build PRoot from source ZIP (arm64, static)
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: "PRoot source ZIP path in this repository"
+        required: true
+        default: "tools/proot/v5_5_0_source_code.zip"
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - name: Build in arm64 Alpine
+        env:
+          ZIP_PATH: ${{ inputs.zip_path }}
+        run: |
+          set -euo pipefail
+          [ -f "$ZIP_PATH" ] || { echo "::error::ZIP not found: $ZIP_PATH"; exit 1; }
+          mkdir -p out
+          docker run --rm --platform linux/arm64 -e ZIP_PATH -v "$PWD":/w -w /w alpine:3.20 sh /w/tools/proot/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: proot-arm64-static
+          path: out/*
+          if-no-files-found: error
