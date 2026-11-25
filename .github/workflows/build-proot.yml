@@ -26,7 +26,15 @@ jobs:
           apk add --no-cache talloc-static >/dev/null 2>&1 || true
           rm -rf /tmp/pb && mkdir /tmp/pb && cd /tmp/pb
           unzip -q "/w/$ZIP_PATH"
-          cd proot-*
+          # accept a zip that contains another zip (e.g. the whole kit)
+          for i in 1 2 3; do
+            [ -n "$(find . -path '*/src/GNUmakefile' | head -n1)" ] && break
+            for z in $(find . -name '*.zip'); do unzip -q -o "$z" -d "$(dirname "$z")/x$i" || true; done
+          done
+          MK=$(find . -path '*/src/GNUmakefile' | head -n1)
+          [ -n "$MK" ] || { echo "ERROR: no PRoot source (src/GNUmakefile) inside $ZIP_PATH"; exit 1; }
+          cd "$(dirname "$(dirname "$MK")")"
+          pwd
           export WITHOUT_PYTHON=1
           make -C src clean loader.elf build.h WITHOUT_PYTHON=1 CPPFLAGS="-I/usr/include"
           LDFLAGS="-static" make -C src proot WITHOUT_PYTHON=1 CPPFLAGS="-I/usr/include"
