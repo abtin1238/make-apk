@@ -6,7 +6,7 @@ on:
       zip_path:
         description: "PRoot source ZIP path in this repository"
         required: true
-        default: "tools/proot/v5_5_0_source_code.zip"
+        default: "v5_5_0_source_code.zip"
         type: string
 
 jobs:
@@ -18,6 +18,27 @@ jobs:
       - uses: docker/setup-qemu-action@v3
         with:
           platforms: arm64
+      - name: Write build script
+        run: |
+          cat > "$RUNNER_TEMP/build-proot.sh" <<'EOS'
+          set -eu
+          apk add --no-cache build-base linux-headers pkgconf talloc-dev uthash-dev unzip file binutils >/dev/null
+          apk add --no-cache talloc-static >/dev/null 2>&1 || true
+          rm -rf /tmp/pb && mkdir /tmp/pb && cd /tmp/pb
+          unzip -q "/w/$ZIP_PATH"
+          cd proot-*
+          export WITHOUT_PYTHON=1
+          make -C src clean loader.elf build.h WITHOUT_PYTHON=1 CPPFLAGS="-I/usr/include"
+          LDFLAGS="-static" make -C src proot WITHOUT_PYTHON=1 CPPFLAGS="-I/usr/include"
+          mkdir -p /w/out
+          strip src/proot
+          cp src/proot /w/out/libproot.so
+          if [ -f src/loader.elf ]; then cp src/loader.elf /w/out/libproot-loader.so; else echo "no separate loader.elf"; fi
+          file /w/out/libproot.so
+          src/proot --version | head -3 || true
+          echo "statx mentions: $(strings -a /w/out/libproot.so | grep -c statx || true)"
+          ls -la /w/out
+          EOS
       - name: Build in arm64 Alpine
         env:
           ZIP_PATH: ${{ inputs.zip_path }}
@@ -25,7 +46,7 @@ jobs:
           set -euo pipefail
           [ -f "$ZIP_PATH" ] || { echo "::error::ZIP not found: $ZIP_PATH"; exit 1; }
           mkdir -p out
-          docker run --rm --platform linux/arm64 -e ZIP_PATH -v "$PWD":/w -w /w alpine:3.20 sh /w/tools/proot/build.sh
+          docker run --rm --platform linux/arm64 -e ZIP_PATH -v "$PWD":/w -v "$RUNNER_TEMP/build-proot.sh":/build.sh:ro -w /w alpine:3.20 sh /build.sh
       - uses: actions/upload-artifact@v4
         with:
           name: proot-arm64-static
