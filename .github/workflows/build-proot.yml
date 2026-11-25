@@ -22,7 +22,7 @@ jobs:
         run: |
           cat > "$RUNNER_TEMP/build-proot.sh" <<'EOS'
           set -eu
-          apk add --no-cache build-base linux-headers pkgconf talloc-dev uthash-dev unzip file binutils >/dev/null
+          apk add --no-cache build-base linux-headers bsd-compat-headers pkgconf talloc-dev uthash-dev unzip file binutils >/dev/null
           apk add --no-cache talloc-static >/dev/null 2>&1 || true
           rm -rf /tmp/pb && mkdir /tmp/pb && cd /tmp/pb
           unzip -q "/w/$ZIP_PATH"
